@@ -1,0 +1,114 @@
+#!/usr/bin/env ruby
+
+# frozen_string_literal: true
+#
+# Run many mock requests against the Storefront app, with stackprof enabled to
+# collect CPU or memory statistics.
+#
+# I recommend speedscope for navigating the output.
+# This can be done by dragging tmp/last_profile_stackcollapse into https://speedscope.app
+# or with `npm install -g speedscope` and `speedscope ./tmp/last_profile_stackcollapse`
+
+require 'bundler/setup'
+require 'optparse'
+require 'benchmark'
+require 'rack/mock'
+require 'aggregate'
+require 'descriptive_statistics'
+
+USE_PRODUCTION_SPEED = true
+
+require_relative '../lib/rack/lobster'
+
+class Profiler
+
+  def initialize(urls: %w(tcp://0.0.0.0:9292), times:, stackprof_mode: nil, stackprof_interval: nil, memory_profiler: false, bare: false)
+    @urls = urls
+    @times = times
+    @bare = bare
+    @stackprof_mode = stackprof_mode
+    @stackprof_interval = stackprof_interval
+  end
+
+  def profile
+    timings = []
+    response_codes = Hash.new(0)
+
+    rack_app = new_rack_app
+
+    @times.times do
+      @urls.map do |url|
+        env = make_rack_env(url)
+
+        timings << time_given_block do
+          response = rack_app.call(env)
+          response_codes[response[0]] += 1
+        end
+
+        print("\r#{timings.size} requests done...")
+        # puts "Responses by status: #{response_codes.inspect}"
+        print_timing_statistics(timings.drop(timings.size / 2))
+      end
+    end
+    print_timing_statistics(timings.drop(timings.size / 2))
+  end
+
+  private
+
+  def time_given_block
+    if @bare
+      yield
+      nil
+    else
+      Benchmark.measure { yield }
+    end
+  end
+
+  def print_timing_statistics(timings)
+    print_statistics('Real time (ms) per request distribution', timings.map(&:real))
+    #print_statistics('CPU time (ms) per request distribution', timings.map(&:total))
+  end
+
+  def print_statistics(title, timings)
+    timings = timings.map { |v| 1000 * v }
+    aggregate = Aggregate.new(0, 2500, 5)
+    timings.each { |timing| aggregate << timing }
+
+    # puts
+    # puts title
+    puts format(
+      "(%.2f min, %.2f median %.2f avg, %.2f p90, %.2f max, %.2f stddev)",
+      timings.min,
+      timings.median,
+      timings.mean,
+      timings.percentile(90),
+      timings.max,
+      timings.standard_deviation
+    )
+    # puts
+    # puts aggregate.to_s
+    # puts
+  end
+
+  def new_rack_app
+    Rack::Lobster.new
+  end
+
+  def make_rack_env(url)
+    env = Rack::MockRequest.env_for(url)
+    env['HTTP_HOST'] = env['SERVER_NAME']
+    env['HTTP_X_FORWARDED_PROTO'] = 'https'
+    env
+  end
+end
+
+options = { times: 8500 }
+
+# unless system("sudo -n true 2>/dev/null")
+#   puts "Enter password to maximize CPU scheduling priority of this process."
+# end
+
+# system("sudo renice -20 -p #{Process.pid}")
+
+profiler = Profiler.new(**options)
+profiler.profile
